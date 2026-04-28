@@ -75,6 +75,16 @@ try:
 except ImportError:
     NPU_AVAILABLE = False
 
+from npu_opt import (
+    NPU_AVAILABLE as _NPU_OPT_AVAILABLE,
+    apply_all_npu_optimizations,
+    apply_graph_runner_optimizations,
+    set_fia_max_cache_len,
+    set_fia_graph_capture,
+    update_fia_state,
+    get_fia_state,
+)
+
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MAX_LLM_SEQ_INP_LEN = 750
@@ -96,6 +106,7 @@ HF_SAMPLE_TOP_P = 0.8
 HF_SAMPLE_TOP_K = 25
 HF_SAMPLE_TEMPERATURE = 0.7
 DEFAULT_HF_GRAPH_BUCKETS = "512,1024,1536"
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -390,14 +401,79 @@ class HFNpuGraphDecodeRunner:
         self.current_pos = 0
         self._cache_initialized = False
         self._graph_built = False
+        self._use_fia = (
+            NPU_AVAILABLE
+            and getattr(llm.llama.config, "_attn_implementation", None) == "npu_fused"
+        )
+        self._npu_graph = None
+        self._logits_buf = None
+        self.fia_mask_buf = None
+        self.fia_workspace = None
+        self.fia_output_bufs = {}
+        self.fia_lse_bufs = {}
+        if self._use_fia:
+            self._init_fia_buffers()
+            set_fia_max_cache_len(self.max_cache_len)
+        self._use_rope_rms = False
+        self._use_mlp_fuse = False
+        if apply_graph_runner_optimizations(llm, self.max_cache_len, self.position_ids_buf):
+            self._use_rope_rms = True
+            self._use_mlp_fuse = True
 
     def can_handle(self, prefill_len: int, max_new_tokens: int) -> bool:
         return (int(prefill_len) + int(max_new_tokens)) <= self.max_cache_len
+
+    def _init_fia_buffers(self):
+        import torch_npu
+
+        config = self.llm.llama.config
+        num_heads = config.num_attention_heads
+        num_kv_heads = config.num_key_value_heads
+        head_dim = config.head_dim
+
+        self.fia_mask_buf = torch.ones(
+            1, self.max_cache_len, dtype=torch.int8, device=self.device
+        )
+        n_layers = config.num_hidden_layers
+        for i in range(n_layers):
+            self.fia_output_bufs[i] = torch.zeros(
+                1, num_heads, 1, head_dim, dtype=self.embed_dtype, device=self.device
+            )
+            self.fia_lse_bufs[i] = torch.zeros(1, dtype=torch.float32, device=self.device)
+
+        q_sample = torch.randn(
+            1, num_heads, 1, head_dim, dtype=self.embed_dtype, device=self.device
+        )
+        k_sample = torch.randn(
+            1, num_kv_heads, self.max_cache_len, head_dim, dtype=self.embed_dtype, device=self.device
+        )
+        v_sample = torch.randn(
+            1, num_kv_heads, self.max_cache_len, head_dim, dtype=self.embed_dtype, device=self.device
+        )
+        self.fia_workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+            query=q_sample,
+            key=k_sample,
+            value=v_sample,
+            atten_mask=self.fia_mask_buf,
+            input_layout="BNSD",
+            actual_seq_lengths_kv=[self.max_cache_len],
+            num_key_value_heads=num_kv_heads,
+            num_heads=num_heads,
+            scale=head_dim ** -0.5,
+            sparse_mode=1,
+        )
+        ws_mb = self.fia_workspace.numel() * self.fia_workspace.element_size() / 1024 / 1024
+        logging.info(
+            "[fia] buffers allocated: %d layers, workspace=%.0f MB, max_cache_len=%d",
+            n_layers, ws_mb, self.max_cache_len,
+        )
 
     def reset(self):
         if self._cache_initialized:
             self.static_cache.reset()
         self.current_pos = 0
+        if self._use_fia and self.fia_mask_buf is not None:
+            self.fia_mask_buf.fill_(1)
 
     def _step_logits_impl(self, input_embeds):
         position_embeddings = self.llm.llama.model.rotary_emb(
@@ -424,18 +500,35 @@ class HFNpuGraphDecodeRunner:
         if self._graph_built:
             return
         logging.info(
-            "[hf_graph] building static single-step graph max_cache_len=%s warmup_iters=%s",
+            "[hf_graph] building static single-step graph max_cache_len=%s warmup_iters=%s fia=%s mlp_fuse=%s",
             self.max_cache_len,
             self.warmup_iters,
+            self._use_fia,
+            self._use_mlp_fuse,
         )
+        if self._use_fia:
+            update_fia_state(
+                workspace=self.fia_workspace,
+                output_bufs=self.fia_output_bufs,
+                lse_bufs=self.fia_lse_bufs,
+                mask_buf=self.fia_mask_buf,
+                max_cache_len=self.max_cache_len,
+            )
         for _ in range(self.warmup_iters):
             _ = self._step_logits_impl(self.input_embeds_buf)
         torch.npu.synchronize()
-        self.graphed_step = torch.npu.make_graphed_callables(
-            self._step_logits_impl,
-            (self.input_embeds_buf,),
-            num_warmup_iters=self.warmup_iters,
-        )
+        if self._use_fia:
+            self._npu_graph = torch.npu.NPUGraph()
+            set_fia_graph_capture(True)
+            with torch.npu.graph(self._npu_graph):
+                self._logits_buf = self._step_logits_impl(self.input_embeds_buf)
+            set_fia_graph_capture(False)
+        else:
+            self.graphed_step = torch.npu.make_graphed_callables(
+                self._step_logits_impl,
+                (self.input_embeds_buf,),
+                num_warmup_iters=self.warmup_iters,
+            )
         torch.npu.synchronize()
         self._graph_built = True
 
@@ -444,6 +537,9 @@ class HFNpuGraphDecodeRunner:
         self.attention_mask_buf.fill_(self.mask_fill_value)
         prefill_len = len(full_input_ids)
         self.attention_mask_buf[..., :prefill_len] = 0
+        if self._use_fia and self.fia_mask_buf is not None:
+            self.fia_mask_buf.fill_(1)
+            self.fia_mask_buf[0, :prefill_len] = 0
         input_tensor = torch.tensor([full_input_ids], dtype=torch.long, device=self.device)
         inputs_embeds = self.llm.llama_embedding(input_tensor)
         prefill_last_idx = torch.tensor([prefill_len - 1], dtype=torch.long, device=self.device)
@@ -464,13 +560,30 @@ class HFNpuGraphDecodeRunner:
         self.cache_position_buf[0] = self.current_pos
         self.position_ids_buf[0, 0] = self.current_pos
         self.attention_mask_buf[..., self.current_pos] = 0
+        if self._use_fia and self.fia_mask_buf is not None:
+            self.fia_mask_buf[0, self.current_pos] = 0
 
     def step(self, sampled_abs_token: int):
         self._prepare_step_buffers(sampled_abs_token)
+        if os.environ.get("GLMTTS_NO_GRAPH_REPLAY", "").strip().lower() in ("1", "true"):
+            if self._use_fia and not get_fia_state().get("max_cache_len") == self.max_cache_len:
+                update_fia_state(
+                    workspace=self.fia_workspace,
+                    output_bufs=self.fia_output_bufs,
+                    lse_bufs=self.fia_lse_bufs,
+                    mask_buf=self.fia_mask_buf,
+                    max_cache_len=self.max_cache_len,
+                )
+            self._logits_buf = self._step_logits_impl(self.input_embeds_buf)
+            self.current_pos += 1
+            return self._logits_buf[0].log_softmax(dim=-1)
         self._build_graph()
-        logits = self.graphed_step(self.input_embeds_buf)
+        if self._use_fia and self._npu_graph is not None:
+            self._npu_graph.replay()
+        else:
+            self._logits_buf = self.graphed_step(self.input_embeds_buf)
         self.current_pos += 1
-        return logits[0].log_softmax(dim=-1)
+        return self._logits_buf[0].log_softmax(dim=-1)
 
     @torch.inference_mode()
     def prime_graph(self):
@@ -484,9 +597,14 @@ class HFNpuGraphDecodeRunner:
         self.token_id_buf.zero_()
         self.input_embeds_buf.copy_(self.llm.llama_embedding(self.token_id_buf))
         self.attention_mask_buf[..., 0] = 0
+        if self._use_fia and self.fia_mask_buf is not None:
+            self.fia_mask_buf.fill_(1)
+            self.fia_mask_buf[0, 0] = 0
         self._build_graph()
         self.static_cache.reset()
         self.attention_mask_buf.fill_(self.mask_fill_value)
+        if self._use_fia and self.fia_mask_buf is not None:
+            self.fia_mask_buf.fill_(1)
         self.current_pos = 0
         self._cache_initialized = False
 
@@ -532,9 +650,9 @@ def _maybe_get_hf_graph_runner(llm, required_cache_len: int | None = None):
         )
         llm.hf_graph_decode = False
         return None
-    if getattr(llm.llama.config, "_attn_implementation", None) != "eager":
+    if getattr(llm.llama.config, "_attn_implementation", None) not in ("eager", "npu_fused"):
         logging.warning(
-            "[hf_graph] attn_implementation=%s is not graph-safe here; require eager, fallback to eager decode",
+            "[hf_graph] attn_implementation=%s is not graph-safe here; require eager or npu_fused, fallback to eager decode",
             getattr(llm.llama.config, "_attn_implementation", None),
         )
         llm.hf_graph_decode = False
@@ -619,8 +737,11 @@ def _hf_stepwise_forward_dynamic(
 
     out_tokens = []
     past_key_values = None
+    _dump_dir = "/tmp/sampling_dump_eager"
+    os.makedirs(_dump_dir, exist_ok=True)
 
     for i in range(max_len):
+        logging.info("[eager] step %d/%d", i, max_len)
         logits_to_keep = (
             torch.tensor([inputs_embeds.shape[1] - 1], dtype=torch.long, device=device)
             if inputs_embeds.shape[1] > 1
@@ -635,6 +756,8 @@ def _hf_stepwise_forward_dynamic(
         )
         past_key_values = outputs.past_key_values
         logp = outputs.logits[0, -1].log_softmax(dim=-1)
+        logging.info("[eager] step %d logits ok, logp stats: min=%.2f max=%.2f has_inf=%s",
+                     i, logp.min().item(), logp.max().item(), torch.isinf(logp).any().item())
 
         if sample_method == "ras":
             if i < min_len:
@@ -687,6 +810,8 @@ def _hf_stepwise_forward_static_graph(
     full_input_ids = _build_full_input_ids(
         llm, prompt_text_token, tts_text_token, prompt_speech_token, []
     )
+    torch.save({"full_input_ids": full_input_ids, "min_len": min_len, "max_len": max_len},
+               "/tmp/real_input_ids.pt")
     required_cache_len = len(full_input_ids) + max_len
     runner = _maybe_get_hf_graph_runner(llm, required_cache_len=required_cache_len)
     if runner is None:
@@ -714,6 +839,25 @@ def _hf_stepwise_forward_static_graph(
 
     logp = runner.prefill(full_input_ids)
     out_tokens = []
+    _dump_dir = "/tmp/sampling_dump"
+    os.makedirs(_dump_dir, exist_ok=True)
+    _dump_idx = 0
+
+    _prof_cfg = os.environ.get("GLMTTS_PROFILE_DECODE", "").strip()
+    _prof_active = int(_prof_cfg) if _prof_cfg else 0
+    _prof_ctx = None
+    if _prof_active > 0:
+        import torch_npu as _tnpu
+        _prof_dir = os.environ.get("GLMTTS_PROFILE_DIR", "/home/y00623165/glmtts-910b/profiling_opt")
+        os.makedirs(_prof_dir, exist_ok=True)
+        _prof_ctx = _tnpu.profiler.profile(
+            activities=[_tnpu.profiler.ProfilerActivity.CPU, _tnpu.profiler.ProfilerActivity.NPU],
+            schedule=_tnpu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1),
+            on_trace_ready=_tnpu.profiler.tensorboard_trace_handler(_prof_dir),
+            record_shapes=True, with_stack=False, with_flops=False,
+        )
+        _prof_ctx.__enter__()
+        logging.info("[profile] profiling %d decode steps -> %s", _prof_active, _prof_dir)
 
     for i in range(max_len):
         if sample_method == "ras":
@@ -740,7 +884,32 @@ def _hf_stepwise_forward_static_graph(
             break
 
         out_tokens.append(top_ids)
-        logp = runner.step(top_ids)
+        try:
+            logp_new = runner.step(top_ids)
+            torch.npu.synchronize()
+            logp = logp_new
+        except RuntimeError as e:
+            logging.error("[dump] step %d FAILED after token=%d, dumping state", i, top_ids)
+            torch.save({
+                "step": i,
+                "top_ids": top_ids,
+                "out_tokens": list(out_tokens),
+                "error": str(e),
+            }, os.path.join(_dump_dir, "crash.pt"))
+            raise
+        if _prof_ctx is not None and len(out_tokens) >= _prof_active:
+            torch.npu.synchronize()
+            _prof_ctx.step()
+            _prof_ctx.__exit__(None, None, None)
+            _prof_ctx = None
+            logging.info("[profile] profiling done at step %d", i)
+        _dump_idx += 1
+        if _dump_idx % 50 == 0:
+            torch.save({
+                "step": i,
+                "logp": logp.cpu().clone(),
+                "out_tokens": list(out_tokens),
+            }, os.path.join(_dump_dir, f"step_{i:06d}.pt"))
 
     return [token_id - llm.ats for token_id in out_tokens]
 
@@ -1297,7 +1466,7 @@ def load_models(
         if llm.hf_graph_decode and hf_attn_implementation is None:
             hf_attn_implementation = "eager"
             logging.info(
-                "[hf_graph] auto-set hf_attn_implementation=eager for static decode graph"
+                "[hf_graph] auto-set hf_attn_implementation=eager for static decode graph (may be overridden by npu_fused)"
             )
         dtype_map = {
             "bf16": torch.bfloat16,
@@ -1321,6 +1490,7 @@ def load_models(
         llm.llama.eval()
         llm.llama_embedding = llm.llama.model.embed_tokens
         llm.vllm_engine = None
+        apply_all_npu_optimizations(llm)
         logging.info(
             "HF stepwise LLM is Ready! attn_implementation=%s",
             getattr(llm.llama.config, "_attn_implementation", None),
