@@ -737,11 +737,8 @@ def _hf_stepwise_forward_dynamic(
 
     out_tokens = []
     past_key_values = None
-    _dump_dir = "/tmp/sampling_dump_eager"
-    os.makedirs(_dump_dir, exist_ok=True)
 
     for i in range(max_len):
-        logging.info("[eager] step %d/%d", i, max_len)
         logits_to_keep = (
             torch.tensor([inputs_embeds.shape[1] - 1], dtype=torch.long, device=device)
             if inputs_embeds.shape[1] > 1
@@ -756,8 +753,6 @@ def _hf_stepwise_forward_dynamic(
         )
         past_key_values = outputs.past_key_values
         logp = outputs.logits[0, -1].log_softmax(dim=-1)
-        logging.info("[eager] step %d logits ok, logp stats: min=%.2f max=%.2f has_inf=%s",
-                     i, logp.min().item(), logp.max().item(), torch.isinf(logp).any().item())
 
         if sample_method == "ras":
             if i < min_len:
@@ -810,8 +805,6 @@ def _hf_stepwise_forward_static_graph(
     full_input_ids = _build_full_input_ids(
         llm, prompt_text_token, tts_text_token, prompt_speech_token, []
     )
-    torch.save({"full_input_ids": full_input_ids, "min_len": min_len, "max_len": max_len},
-               "/tmp/real_input_ids.pt")
     required_cache_len = len(full_input_ids) + max_len
     runner = _maybe_get_hf_graph_runner(llm, required_cache_len=required_cache_len)
     if runner is None:
@@ -839,25 +832,6 @@ def _hf_stepwise_forward_static_graph(
 
     logp = runner.prefill(full_input_ids)
     out_tokens = []
-    _dump_dir = "/tmp/sampling_dump"
-    os.makedirs(_dump_dir, exist_ok=True)
-    _dump_idx = 0
-
-    _prof_cfg = os.environ.get("GLMTTS_PROFILE_DECODE", "").strip()
-    _prof_active = int(_prof_cfg) if _prof_cfg else 0
-    _prof_ctx = None
-    if _prof_active > 0:
-        import torch_npu as _tnpu
-        _prof_dir = os.environ.get("GLMTTS_PROFILE_DIR", "/home/y00623165/glmtts-910b/profiling_opt")
-        os.makedirs(_prof_dir, exist_ok=True)
-        _prof_ctx = _tnpu.profiler.profile(
-            activities=[_tnpu.profiler.ProfilerActivity.CPU, _tnpu.profiler.ProfilerActivity.NPU],
-            schedule=_tnpu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1),
-            on_trace_ready=_tnpu.profiler.tensorboard_trace_handler(_prof_dir),
-            record_shapes=True, with_stack=False, with_flops=False,
-        )
-        _prof_ctx.__enter__()
-        logging.info("[profile] profiling %d decode steps -> %s", _prof_active, _prof_dir)
 
     for i in range(max_len):
         if sample_method == "ras":
@@ -884,32 +858,7 @@ def _hf_stepwise_forward_static_graph(
             break
 
         out_tokens.append(top_ids)
-        try:
-            logp_new = runner.step(top_ids)
-            torch.npu.synchronize()
-            logp = logp_new
-        except RuntimeError as e:
-            logging.error("[dump] step %d FAILED after token=%d, dumping state", i, top_ids)
-            torch.save({
-                "step": i,
-                "top_ids": top_ids,
-                "out_tokens": list(out_tokens),
-                "error": str(e),
-            }, os.path.join(_dump_dir, "crash.pt"))
-            raise
-        if _prof_ctx is not None and len(out_tokens) >= _prof_active:
-            torch.npu.synchronize()
-            _prof_ctx.step()
-            _prof_ctx.__exit__(None, None, None)
-            _prof_ctx = None
-            logging.info("[profile] profiling done at step %d", i)
-        _dump_idx += 1
-        if _dump_idx % 50 == 0:
-            torch.save({
-                "step": i,
-                "logp": logp.cpu().clone(),
-                "out_tokens": list(out_tokens),
-            }, os.path.join(_dump_dir, f"step_{i:06d}.pt"))
+        logp = runner.step(top_ids)
 
     return [token_id - llm.ats for token_id in out_tokens]
 
