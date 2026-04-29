@@ -106,57 +106,27 @@ def init_weights(m, mean=0.0, std=0.01):
 
 # Repetition Aware Sampling in VALL-E 2
 def ras_sampling(weighted_scores, decoded_tokens, sampling, top_p=0.8, top_k=25, win_size=10, tau_r=0.1, temperature=1.0):
-    import os
-    _use_dst = os.environ.get("GLMTTS_NPU_OPT", "1").strip().lower() not in ("0", "false")
-    _use_dst = _use_dst and os.environ.get("GLMTTS_DISABLE_DST_SAMPLING", "").strip().lower() not in ("1", "true")
-    if _use_dst:
-        top_ids = dst_sampling(weighted_scores, top_p=top_p, top_k=top_k)
-    else:
-        top_ids = nucleus_sampling(weighted_scores, top_p=top_p, top_k=top_k, temperature=temperature)
+    top_ids = nucleus_sampling(weighted_scores, top_p=top_p, top_k=top_k, temperature=temperature)
     rep_num = (torch.tensor(decoded_tokens[-win_size:]).to(weighted_scores.device) == top_ids).sum().item()
     if rep_num >= win_size * tau_r:
         top_ids = random_sampling(weighted_scores, decoded_tokens, sampling)
     return top_ids
 
 
-# Adapted from Ascend ModelZoo CosyVoice2 optimization patch.
-# Source: https://gitcode.com/ascend/ModelZoo-PyTorch/blob/master/ACL_PyTorch/built-in/audio/CosyVoice2/800I/diff_CosyVoice_800I.patch
-# Replaces the Python for-loop in nucleus_sampling with vectorized PyTorch ops.
-def dst_sampling(weighted_scores, top_p=0.8, top_k=25):
-    sorted_value, sorted_idx = weighted_scores.softmax(dim=0).sort(descending=True, stable=True)
-    # NPU bf16 cumsum on long vectors (e.g. 98304) is ~70x slower than float32.
-    # This is a known gap: CANN Cumsum does not have an optimized bf16 aicore kernel.
-    # Cast to float32 restores normal performance with negligible precision impact.
-    sorted_value = sorted_value.float()
-    cum_sum = torch.cumsum(sorted_value, dim=0)
-    n = sorted_value.size(0)
-    device = cum_sum.device
-    pre_cum_sum = torch.cat([torch.zeros(1, device=device), cum_sum[:-1]])
-    indices = torch.arange(n, device=device)
-    condition = (pre_cum_sum < top_p) & (indices < top_k)
-    max_i_tensor = torch.where(condition, indices, torch.tensor(-1, device=device))
-    n_selected = max_i_tensor.max() + 1
-    selected_prob = sorted_value[:n_selected]
-    selected_indices = sorted_idx[:n_selected]
-    top_ids = selected_indices[selected_prob.multinomial(1, replacement=True)]
-    return top_ids
-
-
 def nucleus_sampling(weighted_scores, top_p=0.8, top_k=25, temperature=1.0):
-    prob, indices = [], []
-    cum_prob = 0.0
     scaled_scores = weighted_scores / temperature
     sorted_value, sorted_idx = scaled_scores.softmax(dim=0).sort(descending=True, stable=True)
-    for i in range(len(sorted_idx)):
-        # sampling both top-p and numbers.
-        if cum_prob < top_p and len(prob) < top_k:
-            cum_prob += sorted_value[i]
-            prob.append(sorted_value[i])
-            indices.append(sorted_idx[i])
-        else:
+    topk_val = sorted_value[:top_k].cpu()
+    topk_idx = sorted_idx[:top_k].cpu()
+    cum_prob = 0.0
+    cutoff = top_k
+    for i in range(top_k):
+        cum_prob += topk_val[i].item()
+        if cum_prob >= top_p:
+            cutoff = i + 1
             break
-    prob = torch.tensor(prob).to(weighted_scores)
-    indices = torch.tensor(indices, dtype=torch.long).to(weighted_scores.device)
+    prob = topk_val[:cutoff].to(weighted_scores)
+    indices = topk_idx[:cutoff].to(weighted_scores.device)
     top_ids = indices[prob.multinomial(1, replacement=True)]
     return top_ids
 
