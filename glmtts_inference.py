@@ -407,7 +407,6 @@ class HFNpuGraphDecodeRunner:
         )
         self._npu_graph = None
         self._logits_buf = None
-        self.fia_mask_buf = None
         self.fia_workspace = None
         self.fia_output_bufs = {}
         self.fia_lse_bufs = {}
@@ -431,9 +430,6 @@ class HFNpuGraphDecodeRunner:
         num_kv_heads = config.num_key_value_heads
         head_dim = config.head_dim
 
-        self.fia_mask_buf = torch.ones(
-            1, self.max_cache_len, dtype=torch.int8, device=self.device
-        )
         n_layers = config.num_hidden_layers
         for i in range(n_layers):
             self.fia_output_bufs[i] = torch.zeros(
@@ -454,13 +450,12 @@ class HFNpuGraphDecodeRunner:
             query=q_sample,
             key=k_sample,
             value=v_sample,
-            atten_mask=self.fia_mask_buf,
             input_layout="BNSD",
             actual_seq_lengths_kv=[self.max_cache_len],
             num_key_value_heads=num_kv_heads,
             num_heads=num_heads,
             scale=head_dim ** -0.5,
-            sparse_mode=1,
+            sparse_mode=3,
         )
         ws_mb = self.fia_workspace.numel() * self.fia_workspace.element_size() / 1024 / 1024
         logging.info(
@@ -472,8 +467,6 @@ class HFNpuGraphDecodeRunner:
         if self._cache_initialized:
             self.static_cache.reset()
         self.current_pos = 0
-        if self._use_fia and self.fia_mask_buf is not None:
-            self.fia_mask_buf.fill_(1)
 
     def _step_logits_impl(self, input_embeds):
         position_embeddings = self.llm.llama.model.rotary_emb(
@@ -511,7 +504,6 @@ class HFNpuGraphDecodeRunner:
                 workspace=self.fia_workspace,
                 output_bufs=self.fia_output_bufs,
                 lse_bufs=self.fia_lse_bufs,
-                mask_buf=self.fia_mask_buf,
                 max_cache_len=self.max_cache_len,
             )
         for _ in range(self.warmup_iters):
@@ -537,9 +529,6 @@ class HFNpuGraphDecodeRunner:
         self.attention_mask_buf.fill_(self.mask_fill_value)
         prefill_len = len(full_input_ids)
         self.attention_mask_buf[..., :prefill_len] = 0
-        if self._use_fia and self.fia_mask_buf is not None:
-            self.fia_mask_buf.fill_(1)
-            self.fia_mask_buf[0, :prefill_len] = 0
         input_tensor = torch.tensor([full_input_ids], dtype=torch.long, device=self.device)
         inputs_embeds = self.llm.llama_embedding(input_tensor)
         prefill_last_idx = torch.tensor([prefill_len - 1], dtype=torch.long, device=self.device)
@@ -560,8 +549,6 @@ class HFNpuGraphDecodeRunner:
         self.cache_position_buf[0] = self.current_pos
         self.position_ids_buf[0, 0] = self.current_pos
         self.attention_mask_buf[..., self.current_pos] = 0
-        if self._use_fia and self.fia_mask_buf is not None:
-            self.fia_mask_buf[0, self.current_pos] = 0
 
     def step(self, sampled_abs_token: int):
         self._prepare_step_buffers(sampled_abs_token)
@@ -571,7 +558,6 @@ class HFNpuGraphDecodeRunner:
                     workspace=self.fia_workspace,
                     output_bufs=self.fia_output_bufs,
                     lse_bufs=self.fia_lse_bufs,
-                    mask_buf=self.fia_mask_buf,
                     max_cache_len=self.max_cache_len,
                 )
             self._logits_buf = self._step_logits_impl(self.input_embeds_buf)
@@ -597,14 +583,9 @@ class HFNpuGraphDecodeRunner:
         self.token_id_buf.zero_()
         self.input_embeds_buf.copy_(self.llm.llama_embedding(self.token_id_buf))
         self.attention_mask_buf[..., 0] = 0
-        if self._use_fia and self.fia_mask_buf is not None:
-            self.fia_mask_buf.fill_(1)
-            self.fia_mask_buf[0, 0] = 0
         self._build_graph()
         self.static_cache.reset()
         self.attention_mask_buf.fill_(self.mask_fill_value)
-        if self._use_fia and self.fia_mask_buf is not None:
-            self.fia_mask_buf.fill_(1)
         self.current_pos = 0
         self._cache_initialized = False
 
