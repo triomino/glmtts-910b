@@ -118,6 +118,7 @@ def apply_npu_fused_attention(llm):
         ob = _fia_state.get("output_bufs", {})
         lb = _fia_state.get("lse_bufs", {})
         ws = _fia_state.get("workspace")
+        attn_mask_buf = _fia_state.get("attn_mask_buf")
 
         # Lazy-allocate per-layer output buffers on first use
         if layer_idx not in ob:
@@ -126,18 +127,19 @@ def apply_npu_fused_attention(llm):
             ob[layer_idx] = torch.zeros(1, num_heads, 1, head_dim, dtype=dt, device=dev)
             lb[layer_idx] = torch.zeros(1, dtype=torch.float32, device=dev)
 
-        # Allocate workspace on first use
-        # sparse_mode=3: built-in causal (lower-triangular), no external mask needed.
-        # For decode (S=1 at last position), causal means attend to all cached tokens.
+        # sparse_mode=0: external bool mask controls which KV positions to attend to.
+        # The mask buffer is updated each step by _prepare_step_buffers.
         if ws is None:
+            _mask_sample = torch.ones(1, 1, 1, max_cl, dtype=torch.bool, device=q.device)
             ws = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 query=torch.randn(1, num_heads, 1, head_dim, dtype=q.dtype, device=q.device),
                 key=torch.randn(1, num_kv_heads, max_cl, head_dim, dtype=q.dtype, device=q.device),
                 value=torch.randn(1, num_kv_heads, max_cl, head_dim, dtype=q.dtype, device=q.device),
                 input_layout="BNSD",
+                atten_mask=_mask_sample,
                 actual_seq_lengths_kv=[max_cl],
                 num_key_value_heads=num_kv_heads, num_heads=num_heads,
-                scale=scale, sparse_mode=3,
+                scale=scale, sparse_mode=0,
             )
             _fia_state["workspace"] = ws
 
@@ -149,11 +151,12 @@ def apply_npu_fused_attention(llm):
         torch_npu.npu_fused_infer_attention_score.out(
             query=q, key=k, value=v,
             input_layout="BNSD",
+            atten_mask=attn_mask_buf if attn_mask_buf is not None else None,
             actual_seq_lengths_kv=[max_cl],
             num_key_value_heads=num_kv_heads,
             num_heads=num_heads,
             scale=scale,
-            sparse_mode=3,
+            sparse_mode=0,
             workspace=ws,
             out=[ob[layer_idx], lb[layer_idx]],
         )
@@ -168,7 +171,7 @@ def apply_npu_fused_attention(llm):
         if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "config"):
             layer.self_attn.config._attn_implementation = "npu_fused"
 
-    logging.info("[npu_opt] FIA enabled (npu_fused_infer_attention_score, BNSD, sparse_mode=3, no external mask)")
+    logging.info("[npu_opt] FIA enabled (npu_fused_infer_attention_score, BNSD, sparse_mode=0, bool attn_mask)")
     return True
 
 
