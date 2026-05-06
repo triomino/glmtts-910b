@@ -456,6 +456,7 @@ class HFNpuGraphDecodeRunner:
             value=v_sample,
             input_layout="BNSD",
             atten_mask=self.fia_attn_mask_buf,
+            actual_seq_lengths=[1],
             actual_seq_lengths_kv=[self.max_cache_len],
             num_key_value_heads=num_kv_heads,
             num_heads=num_heads,
@@ -514,7 +515,6 @@ class HFNpuGraphDecodeRunner:
                 max_cache_len=self.max_cache_len,
                 attn_mask_buf=self.fia_attn_mask_buf,
             )
-        self.fia_attn_mask_buf[..., 0] = True
         for _ in range(self.warmup_iters):
             _ = self._step_logits_impl(self.input_embeds_buf)
         torch.npu.synchronize()
