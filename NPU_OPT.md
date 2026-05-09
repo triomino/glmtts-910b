@@ -53,7 +53,6 @@ Replaces `torch.pow(hidden_states, 2).mean(-1, keepdim=True) + eps` → `torch.r
 Replaces the standard `apply_rotary_pos_emb` (cos/sin multiply + rotate_half) with `_npu_rotary_embedding`.
 
 - **Disabled by default** due to bf16 precision divergence: causes token sampling divergence within 1-2 decode steps
-- ~40% kernel scheduling overhead for negligible compute gain
 - To enable: set `GLMTTS_NPU_OPT=1` (default) and do NOT set `GLMTTS_DISABLE_ROPE` — but see precision caveat
 - TODO: investigate CANN kernel improvements in future versions
 
@@ -124,12 +123,11 @@ Long text (97s audio, single chunk): **RTF=0.28**.
 ### Performance breakdown by optimization
 
 | Config | RTF (short) | RTF (long) | vs eager |
-|---|---|---|---|
+|---|---|---|---|---|
 | Eager (no graph, no fused) | 0.57 | 0.48 | baseline |
-| Graph + all fused incl. RoPE | 0.40 | 0.32 | +29% |
 | **Graph + all fused, no RoPE** | **0.38** | **0.28** | **+40%** |
 
 ## Known Issues
 
-- **RoPE**: `_npu_rotary_embedding` causes token divergence within 1-2 decode steps due to bf16 precision differences with the eager rotation implementation. Disabled by default. The ~40% kernel scheduling overhead is not worth the precision cost.
+- **RoPE**: `_npu_rotary_embedding` causes token divergence within 1-2 decode steps due to bf16 precision differences with the eager rotation implementation. Disabled by default.
 - **RMS Norm** and **MLP fuse**: Both fall back to eager float32 computation during prefill (S>1) to maintain bit-exact prefill output. Only decode steps use the fused kernels.
