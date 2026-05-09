@@ -201,7 +201,7 @@ def get_fia_state():
 #     when using NPUGraph with multiple bucket runners.
 # ---------------------------------------------------------------------------
 def apply_npu_rope_rms(llm, max_cache_len, position_ids_buf):
-    enable_rope = _is_enabled("ROPE")
+    enable_rope = False  # TODO: _npu_rotary_embedding causes token divergence within 1-2 decode steps due to bf16 precision differences; ~40% kernel scheduling overhead but negligible compute gain
     enable_rms = _is_enabled("RMS_NORM")
     if not enable_rms and not enable_rope:
         return False
@@ -234,13 +234,16 @@ def apply_npu_rope_rms(llm, max_cache_len, position_ids_buf):
     _rope_rms_state["head_dim"] = head_dim
     _rope_rms_state["patched"] = True
 
-    # Patch LlamaRMSNorm.forward with npu_rms_norm
+    # Patch LlamaRMSNorm.forward with npu_rms_norm (decode only, S=1)
     if enable_rms:
+        _rope_rms_state["_orig_rms_forward"] = llama_mod.LlamaRMSNorm.forward
         def npu_rms_forward(self, hidden_states):
+            if hidden_states.shape[1] > 1:  # prefill → eager for precision
+                return _rope_rms_state["_orig_rms_forward"](self, hidden_states)
             result, _ = torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)
             return result
         llama_mod.LlamaRMSNorm.forward = npu_rms_forward
-        logging.info("[npu_opt] npu_rms_norm enabled")
+        logging.info("[npu_opt] npu_rms_norm enabled (decode only, S=1)")
 
     # Patch apply_rotary_pos_emb with _npu_rotary_embedding for decode (bs=1, seq=1)
     if enable_rope:
@@ -344,7 +347,8 @@ def apply_npu_mlp_fuse(llm):
     _orig_forward = llama_mod.LlamaMLP.forward
 
     def fused_mlp_forward(self, x):
-        # Single linear for gate+up, then npu_swiglu does silu(gate) * up
+        if x.shape[1] > 1:  # prefill → eager for precision
+            return _orig_forward(self, x)
         gu = F.linear(x, self._gate_up_weight)
         if self._gate_bias is not None:
             h = self._gate_up_weight.shape[0] // 2
